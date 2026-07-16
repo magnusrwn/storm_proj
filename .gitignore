@@ -11,3 +11,6 @@ wheels/
 
 # The .env
 .env
+
+# Data folder:
+backend/data
