@@ -1,21 +1,50 @@
-import json
 import csv
 import logging
 import time
 from dataclasses import dataclass
-import pandas as pd
 import asyncio
-from backend.src.utils.helper import request_with_retry
+from src.utils.helper import RequestWithRetryResponse, request_with_retry
+from pathlib import Path
 
-AIRPORT_DATA_PATH = './data/airports_sorted.csv'
+DATA_DIR = Path(__file__).resolve().parents[2]
+AIRPORT_DATA_PATH = DATA_DIR / "airports_sorted.csv"
+OUTPUT_CSV = DATA_DIR / "weather_api_responses.csv"
+
 BASE_API_URL = 'https://archive-api.open-meteo.com/v1/archive'
-OUTPUT_CSV = './data/weather_api_responses.csv'
 
+# NOTE: Look inito logging more on this file.
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s %(levelname)s %(message)s",
 )
 logger = logging.getLogger(__name__)
+
+DAILY_FIELDS = [
+    "time",
+    "weather_code",
+    "temperature_2m_max",
+    "temperature_2m_min",
+    "apparent_temperature_max",
+    "apparent_temperature_min",
+    "precipitation_sum",
+    "rain_sum",
+    "showers_sum",
+    "snowfall_sum",
+    "snow_depth_max",
+    "cloud_cover_mean",
+    "cloud_cover_max",
+    "wind_speed_10m_max",
+    "wind_gusts_10m_max",
+    "wind_direction_10m_dominant",
+    "pressure_msl_mean",
+    "visibility_mean",
+]
+
+FIELDNAMES = (
+    ["latitude", "longitude"]
+    + [f"daily_units_{field}" for field in DAILY_FIELDS]
+    + [f"daily_{field}" for field in DAILY_FIELDS]
+)
 
 @dataclass
 class RunStats:
@@ -31,26 +60,15 @@ with open(AIRPORT_DATA_PATH, newline="") as f:
     DATA_ROWS_IN = list(reader)
 
 async def fetch_weather_data(
-    queue: asyncio.Queue[dict], date: str, long: str, lat: str, stats: RunStats
+    queue: asyncio.Queue[RequestWithRetryResponse], date: str, long: str, lat: str, stats: RunStats
 ):
     url = f"{BASE_API_URL}?latitude={lat}&longitude={long}&start_date={date}&end_date={date}&daily=weather_code,temperature_2m_max,temperature_2m_min,apparent_temperature_max,apparent_temperature_min,precipitation_sum,rain_sum,showers_sum,snowfall_sum,snow_depth_max,cloud_cover_mean,cloud_cover_max,wind_speed_10m_max,wind_gusts_10m_max,wind_direction_10m_dominant,pressure_msl_mean,visibility_mean&timezone=auto"
 
     try:
         response = await request_with_retry(url, "GET")
 
-        if response.success is not None:
-            await queue.put(response.success)
-            stats.enqueued += 1
-            return
-
-        stats.fetch_failed += 1
-        logger.warning(
-            "Fetch failed: date=%s latitude=%s longitude=%s error=%s",
-            date,
-            lat,
-            long,
-            response.error,
-        )
+        await queue.put(response)
+        stats.enqueued += 1
     except Exception:
         stats.fetch_failed += 1
         logger.exception(
@@ -60,24 +78,54 @@ async def fetch_weather_data(
             long,
         )
 
-async def writer(queue: asyncio.Queue[dict], stats: RunStats):
-    # Keep the full API response until the ML feature columns are decided.  A CSV
-    # cell can store JSON, and this keeps the intermediate output lossless.
-    fieldnames = ["payload"]
+async def writer(queue: asyncio.Queue[RequestWithRetryResponse], stats: RunStats):
 
     # `open` is synchronous; that is fine here because each CSV write is tiny.
     # Do not use `async with` because normal files do not implement an async
     # context manager.
     with open(OUTPUT_CSV, "w", newline="", encoding="utf-8") as file:
-        csv_writer = csv.DictWriter(file, fieldnames=fieldnames)
+        csv_writer = csv.DictWriter(file, fieldnames=FIELDNAMES)
         csv_writer.writeheader()
         
         while True:
             item = await queue.get()
             try:
-                # Later, replace this with a flattened dict containing the
-                # feature columns you choose.
-                csv_writer.writerow({"payload": json.dumps(item)})
+                if item.error is not None:
+                    stats.fetch_failed += 1
+                    logger.warning("Skipping failed weather response: %s", item.error)
+                    continue
+
+                if item.success is None:
+                    stats.fetch_failed += 1
+                    logger.warning("Skipping weather response with no payload")
+                    continue
+
+                payload = item.success
+                daily_units = payload.get("daily_units", {})
+                daily = payload.get("daily", {})
+
+                # Each request is for one date.  Flatten its one-item API arrays
+                # to scalar CSV values, while retaining nulls and empty arrays.
+                row = {
+                    "latitude": payload.get("latitude"),
+                    "longitude": payload.get("longitude"),
+                }
+                row.update(
+                    {
+                        f"daily_units_{field}": daily_units.get(field)
+                        for field in DAILY_FIELDS
+                    }
+                )
+                row.update(
+                    {
+                        f"daily_{field}": values[0]
+                        if isinstance(values := daily.get(field), list) and values
+                        else values
+                        for field in DAILY_FIELDS
+                    }
+                )
+
+                csv_writer.writerow(row)
                 stats.written += 1
             except Exception:
                 stats.write_failed += 1
@@ -85,8 +133,6 @@ async def writer(queue: asyncio.Queue[dict], stats: RunStats):
             finally:
                 queue.task_done()
 
-
-# I WANT TO KEEP: ["daily", "daily_units", "latitude", "longitude"]
 async def main():
     started_at = time.monotonic()
     queue = asyncio.Queue()
