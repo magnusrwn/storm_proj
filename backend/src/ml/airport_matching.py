@@ -32,7 +32,7 @@ unique_lookups_df = (
 )
 
 try:
-    unique_lookups_df.to_csv('./data/airports_sorted.csv') # rememebr to run when in /backend
+    unique_lookups_df.to_csv('./data/airports_sorted.csv')
     print("saved")
 except Exception as e:
     print(f"Error caught while saving to .csv: {e}")
