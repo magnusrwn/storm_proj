@@ -1,7 +1,8 @@
 import pandas as pd
+from pathlib import Path
 
-# Read the saved data. (gathered from juypiter script(s))
-PATH_TO_DATA = '/Users/magnusnewton/Desktop/code/storm_proj/backend/data/cleaned_data.csv'
+DATA_DIR = Path(__file__).resolve().parents[2] / "data"
+PATH_TO_DATA = DATA_DIR / "/cleaned_data.csv"
 
 # Get the data to a DF
 df = pd.read_csv(PATH_TO_DATA)
@@ -32,7 +33,7 @@ unique_lookups_df = (
 )
 
 try:
-    unique_lookups_df.to_csv('./data/airports_sorted.csv') # rememebr to run when in /backend
+    unique_lookups_df.to_csv(DATA_DIR +"/airport/airports_sorted.csv")
     print("saved")
 except Exception as e:
     print(f"Error caught while saving to .csv: {e}")

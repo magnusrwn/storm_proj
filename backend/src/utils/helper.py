@@ -3,17 +3,16 @@ from typing import Any, Literal
 import httpx
 from pydantic import BaseModel
 
-
+# ======================================== MODELS ========================================
 class PresentError(BaseModel):
     description: str
     error: str | None = None
-
 
 class RequestWithRetryResponse(BaseModel):
     success: dict[str, Any] | None = None
     error: PresentError | None = None
 
-
+# ======================================== FUNCTIONS ========================================
 async def request_with_retry(
     url: str,
     method: Literal["GET", "POST", "PUT", "PATCH", "DELETE"],
