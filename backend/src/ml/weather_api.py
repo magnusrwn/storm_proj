@@ -5,20 +5,19 @@ from dataclasses import dataclass
 import asyncio
 from src.utils.helper import RequestWithRetryResponse, request_with_retry
 from pathlib import Path
+from logger_config import configure_logging
+
 
 DATA_DIR = Path(__file__).resolve().parents[2]
+LOG_DIR = Path(__file__).resolve().parents[2] + "/logs"
 AIRPORT_DATA_PATH = DATA_DIR / "airports_sorted.csv"
 OUTPUT_CSV = DATA_DIR / "weather_api_responses.csv"
 
-BASE_API_URL = 'https://archive-api.open-meteo.com/v1/archive'
-
-# NOTE: Look inito logging more on this file.
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s %(levelname)s %(message)s",
-)
 logger = logging.getLogger(__name__)
 
+BASE_API_URL = 'https://archive-api.open-meteo.com/v1/archive'
+
+# NOTE: CEHCK THESE IF NEEDED IN CODE
 DAILY_FIELDS = [
     "time",
     "weather_code",
@@ -79,10 +78,6 @@ async def fetch_weather_data(
         )
 
 async def writer(queue: asyncio.Queue[RequestWithRetryResponse], stats: RunStats):
-
-    # `open` is synchronous; that is fine here because each CSV write is tiny.
-    # Do not use `async with` because normal files do not implement an async
-    # context manager.
     with open(OUTPUT_CSV, "w", newline="", encoding="utf-8") as file:
         csv_writer = csv.DictWriter(file, fieldnames=FIELDNAMES)
         csv_writer.writeheader()
@@ -90,11 +85,13 @@ async def writer(queue: asyncio.Queue[RequestWithRetryResponse], stats: RunStats
         while True:
             item = await queue.get()
             try:
+                # Remember the structure of each resposne item from the api.
+                # If the response is a straight up error, then add it to the error count to be logged
                 if item.error is not None:
                     stats.fetch_failed += 1
                     logger.warning("Skipping failed weather response: %s", item.error)
                     continue
-
+                # if there is no data under the success key, then also add it to the error log count.
                 if item.success is None:
                     stats.fetch_failed += 1
                     logger.warning("Skipping weather response with no payload")
@@ -104,8 +101,8 @@ async def writer(queue: asyncio.Queue[RequestWithRetryResponse], stats: RunStats
                 daily_units = payload.get("daily_units", {})
                 daily = payload.get("daily", {})
 
-                # Each request is for one date.  Flatten its one-item API arrays
-                # to scalar CSV values, while retaining nulls and empty arrays.
+                # Each request is one date. Extract needed data from API repsonse
+                # Build the col.
                 row = {
                     "latitude": payload.get("latitude"),
                     "longitude": payload.get("longitude"),
@@ -134,6 +131,7 @@ async def writer(queue: asyncio.Queue[RequestWithRetryResponse], stats: RunStats
                 queue.task_done()
 
 async def main():
+    configure_logging(LOG_DIR/"weather_api.log")
     started_at = time.monotonic()
     queue = asyncio.Queue()
     stats = RunStats()
@@ -161,7 +159,8 @@ async def main():
     try:
         # Wait till its done
         await writer_task
-    except asyncio.CancelledError:
+    except asyncio.CancelledError as e: # NOTE: Can't this be logged?
+        logger.info("Writer cancelled as expected.")
         pass
 
     elapsed_seconds = time.monotonic() - started_at
@@ -174,8 +173,6 @@ async def main():
         stats.write_failed,
         elapsed_seconds,
     )
-    
 
-
-# Runner
+# Run
 asyncio.run(main())
