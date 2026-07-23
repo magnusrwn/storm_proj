@@ -5,6 +5,7 @@ from dataclasses import dataclass
 import asyncio
 from pathlib import Path
 import sys
+import pandas as pd
 # Here evrything must be set to the project root. As when ran as an independant file, imports are relative, which causes pain.
 PROJ_ROOT = Path(__file__).parents[3]
 sys.path.insert(0, str(PROJ_ROOT))
@@ -49,7 +50,7 @@ API_DAILY_FIELDS = [
 ]
 
 FIELDNAMES = (
-    ["date", "latitude", "longitude"]
+    ["date", "airport_code"]
     + [f"daily_{field}" for field in API_DAILY_FIELDS]
 )
 
@@ -61,18 +62,32 @@ class RunStats:
     write_failed: int = 0
     already_written: int = 0
 
-def load_completed() -> set:
+def load_completed_and_remove_dupes() -> set:
     completed = set()
-    if OUTPUT_CSV.exists() and OUTPUT_CSV.stat().st_size > 0: # Ensure it exists and has more than one thing before reading attempt.
+    if OUTPUT_CSV.exists() and OUTPUT_CSV.stat().st_size > 0:
+
+        # If the output has rows, furst delete all dupes, and re-write before reading
+        data = pd.read_csv(OUTPUT_CSV)
+        rows_before: int = len(data)
+
+        data = data.drop_duplicates(subset=["date", "airport_code"])
+        rows_after: int = len(data)
+        logger.info(f"Dropped {rows_before - rows_after} rows. (Duplicates)")
+
+        # re-write the csv.
+        data.to_csv(OUTPUT_CSV, index=False)
+
+        # Open/ read
         with open(OUTPUT_CSV, newline="", encoding="utf-8") as file:
             for row in csv.DictReader(file):
-                completed.add((row["date"], row["longitude"], row["latitude"]))
+                completed.add((row["date"], row["airport_code"]))
+
     return completed
 
-async def fetch_weather_data(queue: asyncio.Queue[RequestWithRetryResponse], date: str, long: str, lat: str, stats: RunStats, completed:set):
+async def fetch_weather_data(queue: asyncio.Queue[RequestWithRetryResponse], date: str, long: str, lat: str, airport_code:str, stats: RunStats, completed:set):
     url = f"{BASE_API_URL}?latitude={lat}&longitude={long}&start_date={date}&end_date={date}&daily=weather_code,temperature_2m_max,temperature_2m_min,apparent_temperature_max,apparent_temperature_min,precipitation_sum,rain_sum,showers_sum,snowfall_sum,snow_depth_max,cloud_cover_mean,cloud_cover_max,wind_speed_10m_max,wind_gusts_10m_max,wind_direction_10m_dominant,pressure_msl_mean,visibility_mean&timezone=auto"
 
-    if (date, long, lat) in completed:
+    if (date, airport_code) in completed:
         stats.already_written += 1
         return None
 
@@ -81,7 +96,8 @@ async def fetch_weather_data(queue: asyncio.Queue[RequestWithRetryResponse], dat
         response = await request_with_retry(url, "GET")
         queue_item = {
             "response":response,
-            "date":date
+            "date":date,
+            "airport_code":airport_code
         }
         await queue.put(queue_item)
         stats.enqueued += 1
@@ -91,11 +107,10 @@ async def fetch_weather_data(queue: asyncio.Queue[RequestWithRetryResponse], dat
         logger.exception(
             "Unexpected fetch error: date=%s latitude=%s longitude=%s",
             date,
-            lat,
-            long,
+            airport_code
         )
 
-async def writer(queue: asyncio.Queue[RequestWithRetryResponse], stats: RunStats):
+async def writer(queue: asyncio.Queue[RequestWithRetryResponse], stats: RunStats, completed:set):
     with open(OUTPUT_CSV, "a", newline="", encoding="utf-8") as file:
         csv_writer = csv.DictWriter(file, fieldnames=FIELDNAMES)
         file_exists = OUTPUT_CSV.exists() and OUTPUT_CSV.stat().st_size > 0
@@ -106,6 +121,7 @@ async def writer(queue: asyncio.Queue[RequestWithRetryResponse], stats: RunStats
             queue_item = await queue.get()
             item_response = queue_item.get("response", {})
             item_date = queue_item.get("date", "")
+            item_airport_code = queue_item.get("airport_code", "")
             try:
                 # Assure responses
                 if item_response.error is not None:
@@ -122,10 +138,13 @@ async def writer(queue: asyncio.Queue[RequestWithRetryResponse], stats: RunStats
                 payload = item_response.success
                 daily = payload.get("daily", {})
 
+                if (item_date, item_airport_code, long := payload.get("longitude"),lat := payload.get("latitude")) in completed:
+                    logger.info("Found dupe being written")
+                    continue
+
                 row = {
                     "date": item_date,
-                    "latitude": payload.get("latitude"),
-                    "longitude": payload.get("longitude"),
+                    "airport_code": item_airport_code
                 }
                 row.update(
                     {
@@ -152,18 +171,17 @@ async def main():
     logger.info("Starting weather-data run: input_rows=%d output=%s", len(DATA_ROWS), OUTPUT_CSV)
 
     # load all currently completed
-    completed = load_completed()
+    completed = load_completed_and_remove_dupes()
 
     # Creates and starts API req tasks
     fetch_tasks = [
         asyncio.create_task(
-            fetch_weather_data(queue, row["fl_date"], row["long"], row["lat"], stats, completed)
-        )
-        for row in DATA_ROWS
+            fetch_weather_data(queue, row["fl_date"], row["long"], row["lat"], row["airport_code"], stats, completed)
+        ) for row in DATA_ROWS
     ]
     
     # Creates and starts the writer
-    writer_task = asyncio.create_task(writer(queue, stats))
+    writer_task = asyncio.create_task(writer(queue, stats, completed))
 
 
     await asyncio.gather(*fetch_tasks)
@@ -177,7 +195,7 @@ async def main():
     try:
         # Wait till its done
         await writer_task
-    except asyncio.CancelledError as e: # NOTE: Can't this be logged?
+    except asyncio.CancelledError:
         logger.info("Writer cancelled as expected.")
         pass
 
